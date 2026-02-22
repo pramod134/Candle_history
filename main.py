@@ -347,7 +347,7 @@ def _compute_backfill_window(end_cursor: datetime) -> Tuple[datetime, datetime]:
     Because we walk backwards by the oldest returned bar, this does NOT mean "only 30 days total".
     It's a sliding window to guarantee data returns.
     """
-    start = end_cursor - timedelta(days=30)
+    start = end_cursor - timedelta(days=5)
     return start, end_cursor
 
 
