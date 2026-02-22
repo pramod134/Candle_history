@@ -1,29 +1,25 @@
 """
-main.py
+main.py — Alpaca -> Supabase (RTH-only) candle ingestion with robust pagination support.
 
-Alpaca -> Supabase candle ingestion (RTH-only) with two modes:
+Supports two modes:
+  MODE=backfill  : Backfill from now back to YEARS_BACK (default 2 years), then exit.
+                  Auto-skips if DB already contains >= YEARS_BACK of history (earliest_ts <= cutoff).
+  MODE=live      : Continuous updater; polls and upserts only new RTH 1-minute candles.
 
-1) MODE=backfill
-   - Fetches 1-minute candles from "now" back to YEARS_BACK (default 2)
-   - Stores ONLY RTH minutes (09:30–16:00 ET, DST-aware)
-   - AUTO-DISABLE: If DB already contains >= YEARS_BACK of history (earliest_ts <= cutoff),
-     it skips backfill and exits.
-   - Updates ingest_state.last_ts to the newest candle in DB.
+Key improvements in this version:
+  ✅ Always supplies BOTH start and end to Alpaca (avoids empty responses).
+  ✅ Supports Alpaca pagination via next_page_token (optional exhaust mode).
+  ✅ RTH-only filter is DST-safe (America/New_York).
 
-2) MODE=live
-   - Runs continuously
-   - Polls Alpaca for new 1m candles since last cursor
-   - Stores ONLY RTH minutes
-   - Cursor is persisted in ingest_state so restarts are safe.
+Required ENV:
+  APCA_API_KEY_ID
+  APCA_API_SECRET_KEY
+  SUPABASE_URL
+  SUPABASE_SERVICE_ROLE_KEY (recommended) or SUPABASE_KEY
 
-Required env vars:
-- APCA_API_KEY_ID
-- APCA_API_SECRET_KEY
-- SUPABASE_URL
-- SUPABASE_SERVICE_ROLE_KEY   (recommended) or SUPABASE_KEY
+Recommended Supabase tables:
 
-Recommended tables (Supabase SQL):
-
+-- Candle storage (RTH only)
 create table if not exists candle_history (
   symbol text not null,
   ts timestamptz not null,
@@ -39,37 +35,54 @@ create table if not exists candle_history (
 create index if not exists idx_candle_history_symbol_ts
 on candle_history (symbol, ts);
 
+-- Cursor persistence
 create table if not exists ingest_state (
   symbol text primary key,
   last_ts timestamptz,
   updated_at timestamptz not null default now()
 );
 
-Optional env vars:
-- MODE=backfill|live
-- SYMBOL=SPY
-- TABLE_NAME=candle_history
-- STATE_TABLE=ingest_state
-- YEARS_BACK=2
-- LIMIT=4000
-- ALPACA_FEED=iex
-- TIMEFRAME=1Min
-- ADJUSTMENT=raw
-- API_SLEEP_SECONDS=0.35
-- UPSERT_CHUNK=500
-- POLL_SECONDS=20
-- LIVE_LOOKBACK_MIN=120
-- VERIFY_AFTER_BACKFILL=1 (set 0 to skip)
+Optional ENV (sane defaults set below):
+  MODE=backfill|live
+  SYMBOL=SPY
+  TABLE_NAME=candle_history
+  STATE_TABLE=ingest_state
+  YEARS_BACK=2
+  LIMIT=4000
+  ALPACA_FEED=iex
+  TIMEFRAME=1Min
+  ADJUSTMENT=raw
+  API_SLEEP_SECONDS=0.35
+  UPSERT_CHUNK=500
+
+  POLL_SECONDS=20
+  LIVE_LOOKBACK_MIN=120
+
+  VERIFY_AFTER_BACKFILL=1
+
+Pagination controls:
+  FETCH_ALL_PAGES=0|1    (default 0)
+    - If 1: will follow next_page_token and exhaust the entire (start,end) window.
+    - If 0: fetches only the first page (up to LIMIT bars). This is usually enough because the
+      backfill algorithm walks backwards in chunks.
+
+Safety:
+  MAX_PAGE_LOOPS=50      (default 50) max number of page_token fetches in a single request window.
+
+Notes:
+  - The backfill algorithm is designed to NOT need pagination (it walks backwards by oldest bar),
+    but pagination support is included for completeness and future use.
 """
 
 import os
 import time
 import requests
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from supabase import create_client, Client
 from dateutil import tz
+
 
 # =============================
 # ENV CONFIG
@@ -101,6 +114,10 @@ LIVE_LOOKBACK_MIN = int(os.environ.get("LIVE_LOOKBACK_MIN", "120"))
 
 VERIFY_AFTER_BACKFILL = os.environ.get("VERIFY_AFTER_BACKFILL", "1") == "1"
 
+# Pagination behavior
+FETCH_ALL_PAGES = os.environ.get("FETCH_ALL_PAGES", "0") == "1"
+MAX_PAGE_LOOPS = int(os.environ.get("MAX_PAGE_LOOPS", "50"))
+
 ALPACA_BARS_URL = f"https://data.alpaca.markets/v2/stocks/{SYMBOL}/bars"
 
 ET = tz.gettz("America/New_York")
@@ -131,38 +148,69 @@ def is_rth_1m(ts_utc: datetime) -> bool:
         return False
 
     t = ts_et.time()
-    # inclusive 09:30
     if t < datetime(2000, 1, 1, 9, 30).time():
         return False
-    # exclusive 16:00
     if t >= datetime(2000, 1, 1, 16, 0).time():
         return False
     return True
 
 
-def alpaca_get_bars(
-    end_ts_utc: Optional[datetime] = None,
-    start_ts_utc: Optional[datetime] = None,
-    limit: int = 4000,
-) -> List[Dict[str, Any]]:
+def _alpaca_request(params: Dict[str, Any]) -> Dict[str, Any]:
     headers = {
         "APCA-API-KEY-ID": ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
-    params = {
+    r = requests.get(ALPACA_BARS_URL, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json() or {}
+
+
+def alpaca_get_bars(
+    start_ts_utc: datetime,
+    end_ts_utc: datetime,
+    limit: int = 4000,
+    fetch_all_pages: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch bars for [start, end]. Supports pagination via next_page_token.
+
+    If fetch_all_pages=False (default): returns at most one page (up to `limit` bars).
+    If fetch_all_pages=True: follows next_page_token up to MAX_PAGE_LOOPS and returns all bars
+    available in the window (can be large for wide windows).
+    """
+    base_params = {
         "timeframe": TIMEFRAME,
+        "start": iso_z(start_ts_utc),
+        "end": iso_z(end_ts_utc),
         "limit": limit,
         "adjustment": ADJUSTMENT,
         "feed": ALPACA_FEED,
     }
-    if start_ts_utc is not None:
-        params["start"] = iso_z(start_ts_utc)
-    if end_ts_utc is not None:
-        params["end"] = iso_z(end_ts_utc)
 
-    r = requests.get(ALPACA_BARS_URL, headers=headers, params=params, timeout=30)
-    r.raise_for_status()
-    return (r.json() or {}).get("bars", []) or []
+    bars: List[Dict[str, Any]] = []
+
+    payload = _alpaca_request(base_params)
+    bars.extend(payload.get("bars", []) or [])
+    next_token = payload.get("next_page_token")
+
+    if not fetch_all_pages:
+        return bars
+
+    loops = 0
+    while next_token and loops < MAX_PAGE_LOOPS:
+        loops += 1
+        params = dict(base_params)
+        params["page_token"] = next_token
+        payload = _alpaca_request(params)
+
+        page_bars = payload.get("bars", []) or []
+        bars.extend(page_bars)
+        next_token = payload.get("next_page_token")
+
+        # Gentle throttle in case you ever turn fetch_all_pages on for large windows
+        time.sleep(API_SLEEP_SECONDS)
+
+    return bars
 
 
 def normalize_rows(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -264,6 +312,24 @@ def verify_quick(sb: Client, cutoff_utc: datetime, now_utc: datetime) -> None:
 # =============================
 # BACKFILL
 # =============================
+def _compute_backfill_window(end_cursor: datetime) -> Tuple[datetime, datetime]:
+    """
+    We always send BOTH start and end.
+
+    Window sizing:
+      - Using a 30-day window is extremely safe but can be larger than needed.
+      - A tighter window works too, but can occasionally return fewer bars around holidays/low-liquidity.
+
+    We'll use a practical, stable approach:
+      start = end_cursor - 30 days
+
+    Because we walk backwards by the oldest returned bar, this does NOT mean "only 30 days total".
+    It's a sliding window to guarantee data returns.
+    """
+    start = end_cursor - timedelta(days=30)
+    return start, end_cursor
+
+
 def run_backfill(sb: Client) -> None:
     now_utc = datetime.now(timezone.utc)
     cutoff_utc = now_utc - timedelta(days=int(365 * YEARS_BACK))
@@ -271,6 +337,7 @@ def run_backfill(sb: Client) -> None:
     print(f"[BACKFILL] symbol={SYMBOL} tf={TIMEFRAME} feed={ALPACA_FEED}")
     print(f"[BACKFILL] target range: {iso_z(now_utc)} back to {iso_z(cutoff_utc)}")
     print(f"[BACKFILL] writing RTH-only to: {TABLE_CANDLES}")
+    print(f"[BACKFILL] fetch_all_pages={FETCH_ALL_PAGES} (pagination support enabled)")
 
     # --- AUTO-DISABLE if we already have >= YEARS_BACK of history ---
     existing_min_ts = get_db_min_ts(sb)
@@ -281,7 +348,6 @@ def run_backfill(sb: Client) -> None:
                 f"[BACKFILL] History already present "
                 f"(earliest_ts={existing_min_ts} <= cutoff={iso_z(cutoff_utc)}). Skipping backfill."
             )
-            # Ensure state cursor is aligned for live mode
             max_ts = get_db_max_ts(sb)
             set_state_last_ts(sb, max_ts)
             print(f"[BACKFILL] state last_ts set to {max_ts}")
@@ -292,28 +358,39 @@ def run_backfill(sb: Client) -> None:
     total_rth = 0
 
     while end_cursor > cutoff_utc:
-        bars = alpaca_get_bars(end_ts_utc=end_cursor, start_ts_utc=None, limit=LIMIT)
+        start_window, end_window = _compute_backfill_window(end_cursor)
+
+        bars = alpaca_get_bars(
+            start_ts_utc=start_window,
+            end_ts_utc=end_window,
+            limit=LIMIT,
+            fetch_all_pages=FETCH_ALL_PAGES,
+        )
         calls += 1
 
         if not bars:
             print("[BACKFILL] No bars returned; stopping.")
             break
 
+        # Sort returned bars
         bars_sorted = sorted(bars, key=lambda x: x["t"])  # oldest -> newest
 
-        # RTH-only filter
+        # Filter RTH-only
         rth_bars = [b for b in bars_sorted if is_rth_1m(parse_ts(b["t"]))]
 
-        # Store
         rows = normalize_rows(rth_bars)
         upsert_candles(sb, rows)
         total_rth += len(rows)
 
         oldest_ts_str = bars_sorted[0]["t"]
         newest_ts_str = bars_sorted[-1]["t"]
-        print(f"[BACKFILL {calls}] got={len(bars_sorted)} rth={len(rows)}  {oldest_ts_str} -> {newest_ts_str}")
 
-        # Move cursor back 1 minute before oldest returned bar to avoid overlap
+        print(
+            f"[BACKFILL {calls}] window={iso_z(start_window)}..{iso_z(end_window)} "
+            f"got={len(bars_sorted)} rth={len(rows)}  {oldest_ts_str} -> {newest_ts_str}"
+        )
+
+        # Move cursor back 1 minute before the oldest returned bar (prevents overlap)
         end_cursor = parse_ts(oldest_ts_str) - timedelta(minutes=1)
 
         time.sleep(API_SLEEP_SECONDS)
@@ -323,7 +400,6 @@ def run_backfill(sb: Client) -> None:
 
     print(f"[BACKFILL] done. calls={calls} total_rth_upserts≈{total_rth}")
 
-    # Update state cursor to latest DB max ts
     max_ts = get_db_max_ts(sb)
     set_state_last_ts(sb, max_ts)
     print(f"[BACKFILL] state last_ts set to {max_ts}")
@@ -338,6 +414,7 @@ def run_backfill(sb: Client) -> None:
 def run_live(sb: Client) -> None:
     print(f"[LIVE] symbol={SYMBOL} tf={TIMEFRAME} feed={ALPACA_FEED}")
     print(f"[LIVE] polling every {POLL_SECONDS}s; storing RTH-only to {TABLE_CANDLES}")
+    print(f"[LIVE] fetch_all_pages={FETCH_ALL_PAGES} (pagination support enabled)")
 
     # Cursor selection: state -> DB max -> small lookback
     state_ts = get_state_last_ts(sb)
@@ -359,15 +436,21 @@ def run_live(sb: Client) -> None:
         try:
             now_utc = datetime.now(timezone.utc)
 
-            # Pull a small window since last_saved (with slight overlap to be safe)
+            # Pull a small window since last_saved (with overlap)
             start = last_saved - timedelta(minutes=2)
             end = now_utc
 
-            bars = alpaca_get_bars(start_ts_utc=start, end_ts_utc=end, limit=LIMIT)
+            bars = alpaca_get_bars(
+                start_ts_utc=start,
+                end_ts_utc=end,
+                limit=LIMIT,
+                fetch_all_pages=FETCH_ALL_PAGES,
+            )
+
             if bars:
                 bars_sorted = sorted(bars, key=lambda x: x["t"])
 
-                new_rth = []
+                new_rth: List[Dict[str, Any]] = []
                 for b in bars_sorted:
                     ts = parse_ts(b["t"])
                     if ts <= last_saved:
@@ -385,7 +468,6 @@ def run_live(sb: Client) -> None:
                     print(f"[LIVE] wrote {len(rows)} new RTH bars; last_ts={iso_z(last_saved)}")
 
         except Exception as e:
-            # Keep running in Railway
             print(f"[LIVE] ERROR: {e}")
 
         time.sleep(POLL_SECONDS)
