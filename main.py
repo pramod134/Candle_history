@@ -1,5 +1,5 @@
 """
-main.py — Alpaca -> Supabase (RTH-only) candle ingestion with robust pagination support.
+main.py — Alpaca -> Supabase candle ingestion with robust pagination support.
 
 Supports two modes:
   MODE=backfill  : Backfill from now back to YEARS_BACK (default 2 years), then exit.
@@ -125,6 +125,12 @@ VERIFY_AFTER_BACKFILL = os.environ.get("VERIFY_AFTER_BACKFILL", "1") == "1"
 # Pagination behavior
 FETCH_ALL_PAGES = os.environ.get("FETCH_ALL_PAGES", "0") == "1"
 MAX_PAGE_LOOPS = int(os.environ.get("MAX_PAGE_LOOPS", "50"))
+
+# Delay handling (useful for delayed feeds). Defaults:
+# - backfill uses now - 16 minutes
+# - live uses now - 15 minutes
+BACKFILL_END_DELAY_MIN = int(os.environ.get("BACKFILL_END_DELAY_MIN", "16"))
+LIVE_END_DELAY_MIN = int(os.environ.get("LIVE_END_DELAY_MIN", "15"))
 
 ALPACA_BARS_URL = f"https://data.alpaca.markets/v2/stocks/{SYMBOL}/bars"
 
@@ -352,7 +358,8 @@ def _compute_backfill_window(end_cursor: datetime) -> Tuple[datetime, datetime]:
 
 
 def run_backfill(sb: Client) -> None:
-    now_utc = datetime.now(timezone.utc)
+    # Use a slightly delayed "now" so we request bars that should be available on delayed feeds.
+    now_utc = datetime.now(timezone.utc) - timedelta(minutes=BACKFILL_END_DELAY_MIN)
     cutoff_utc = now_utc - timedelta(days=int(365 * YEARS_BACK))
 
     print(f"[BACKFILL] symbol={SYMBOL} tf={TIMEFRAME} feed={ALPACA_FEED}")
@@ -453,7 +460,8 @@ def run_live(sb: Client) -> None:
 
     while True:
         try:
-            now_utc = datetime.now(timezone.utc)
+            # Use a delayed "now" so requests align with delayed feed availability.
+            now_utc = datetime.now(timezone.utc) - timedelta(minutes=LIVE_END_DELAY_MIN)
 
             # Pull a small window since last_saved (with overlap)
             start = last_saved - timedelta(minutes=2)
