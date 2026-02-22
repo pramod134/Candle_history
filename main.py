@@ -9,7 +9,14 @@ Supports two modes:
 Key improvements in this version:
   ✅ Always supplies BOTH start and end to Alpaca (avoids empty responses).
   ✅ Supports Alpaca pagination via next_page_token (optional exhaust mode).
-  ✅ RTH-only filter is DST-safe (America/New_York).
+  ✅ Session labeling is DST-safe (America/New_York).
+
+Session storage:
+  - Stores ONLY 'premarket' + 'rth' candles into DB
+    premarket: 04:00 <= time < 09:30 ET
+    rth:       09:30 <= time < 16:00 ET
+  - Ignores afterhours/overnight
+  - Requires candle_history.session column (text) with values 'premarket'|'rth'
 
 Required ENV:
   APCA_API_KEY_ID
@@ -19,10 +26,11 @@ Required ENV:
 
 Recommended Supabase tables:
 
--- Candle storage (RTH only)
+-- Candle storage (premarket + RTH)
 create table if not exists candle_history (
   symbol text not null,
   ts timestamptz not null,
+  session text not null check (session in ('premarket','rth')),
   open double precision not null,
   high double precision not null,
   low double precision not null,
@@ -139,20 +147,28 @@ def chunked(rows: List[Dict[str, Any]], n: int):
         yield rows[i : i + n]
 
 
-def is_rth_1m(ts_utc: datetime) -> bool:
+def classify_session(ts_utc: datetime) -> Optional[str]:
     """
-    RTH minutes only: 09:30 <= time < 16:00 ET (DST-aware), Mon-Fri.
+    Return:
+      - 'premarket' for 04:00 <= time < 09:30 ET (Mon-Fri)
+      - 'rth'       for 09:30 <= time < 16:00 ET (Mon-Fri)
+      - None        otherwise (afterhours/overnight/weekends)
+    DST-safe via America/New_York conversion.
     """
     ts_et = ts_utc.astimezone(ET)
     if ts_et.weekday() >= 5:
-        return False
+        return None
 
     t = ts_et.time()
-    if t < datetime(2000, 1, 1, 9, 30).time():
-        return False
-    if t >= datetime(2000, 1, 1, 16, 0).time():
-        return False
-    return True
+    pre_start = datetime(2000, 1, 1, 4, 0).time()
+    rth_start = datetime(2000, 1, 1, 9, 30).time()
+    rth_end = datetime(2000, 1, 1, 16, 0).time()
+
+    if pre_start <= t < rth_start:
+        return "premarket"
+    if rth_start <= t < rth_end:
+        return "rth"
+    return None
 
 
 def _alpaca_request(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -220,10 +236,15 @@ def normalize_rows(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
     for b in bars:
+        ts_utc = parse_ts(b["t"])
+        session = classify_session(ts_utc)
+        if session is None:
+            continue
         out.append(
             {
                 "symbol": SYMBOL,
                 "ts": b["t"],
+                "session": session,
                 "open": float(b["o"]),
                 "high": float(b["h"]),
                 "low": float(b["l"]),
@@ -336,7 +357,7 @@ def run_backfill(sb: Client) -> None:
 
     print(f"[BACKFILL] symbol={SYMBOL} tf={TIMEFRAME} feed={ALPACA_FEED}")
     print(f"[BACKFILL] target range: {iso_z(now_utc)} back to {iso_z(cutoff_utc)}")
-    print(f"[BACKFILL] writing RTH-only to: {TABLE_CANDLES}")
+    print(f"[BACKFILL] writing premarket+rth to: {TABLE_CANDLES}")
     print(f"[BACKFILL] fetch_all_pages={FETCH_ALL_PAGES} (pagination support enabled)")
 
     # --- AUTO-DISABLE if we already have >= YEARS_BACK of history ---
@@ -375,19 +396,17 @@ def run_backfill(sb: Client) -> None:
         # Sort returned bars
         bars_sorted = sorted(bars, key=lambda x: x["t"])  # oldest -> newest
 
-        # Filter RTH-only
-        rth_bars = [b for b in bars_sorted if is_rth_1m(parse_ts(b["t"]))]
-
-        rows = normalize_rows(rth_bars)
+        # Keep only premarket+rth inside normalize_rows()
+        rows = normalize_rows(bars_sorted)
         upsert_candles(sb, rows)
-        total_rth += len(rows)
+        total_rth += len(rows)  # 'total_rth' name kept for minimal change; now counts kept rows
 
         oldest_ts_str = bars_sorted[0]["t"]
         newest_ts_str = bars_sorted[-1]["t"]
 
         print(
             f"[BACKFILL {calls}] window={iso_z(start_window)}..{iso_z(end_window)} "
-            f"got={len(bars_sorted)} rth={len(rows)}  {oldest_ts_str} -> {newest_ts_str}"
+            f"got={len(bars_sorted)} kept={len(rows)}  {oldest_ts_str} -> {newest_ts_str}"
         )
 
         # Move cursor back 1 minute before the oldest returned bar (prevents overlap)
@@ -413,7 +432,7 @@ def run_backfill(sb: Client) -> None:
 # =============================
 def run_live(sb: Client) -> None:
     print(f"[LIVE] symbol={SYMBOL} tf={TIMEFRAME} feed={ALPACA_FEED}")
-    print(f"[LIVE] polling every {POLL_SECONDS}s; storing RTH-only to {TABLE_CANDLES}")
+    print(f"[LIVE] polling every {POLL_SECONDS}s; storing premarket+rth to {TABLE_CANDLES}")
     print(f"[LIVE] fetch_all_pages={FETCH_ALL_PAGES} (pagination support enabled)")
 
     # Cursor selection: state -> DB max -> small lookback
@@ -450,22 +469,21 @@ def run_live(sb: Client) -> None:
             if bars:
                 bars_sorted = sorted(bars, key=lambda x: x["t"])
 
-                new_rth: List[Dict[str, Any]] = []
+                new_bars: List[Dict[str, Any]] = []
                 for b in bars_sorted:
                     ts = parse_ts(b["t"])
                     if ts <= last_saved:
                         continue
-                    if not is_rth_1m(ts):
-                        continue
-                    new_rth.append(b)
+                    # session filtering happens in normalize_rows()
+                    new_bars.append(b)
 
-                if new_rth:
-                    rows = normalize_rows(new_rth)
+                if new_bars:
+                    rows = normalize_rows(new_bars)
                     upsert_candles(sb, rows)
 
-                    last_saved = parse_ts(new_rth[-1]["t"])
+                    last_saved = parse_ts(new_bars[-1]["t"])
                     set_state_last_ts(sb, iso_z(last_saved))
-                    print(f"[LIVE] wrote {len(rows)} new RTH bars; last_ts={iso_z(last_saved)}")
+                    print(f"[LIVE] wrote {len(rows)} new candles (premarket+rth); last_ts={iso_z(last_saved)}")
 
         except Exception as e:
             print(f"[LIVE] ERROR: {e}")
