@@ -1102,35 +1102,47 @@ def run_auto(sb: Client) -> None:
                     rows = normalize_rows(candidate_bars)
                     upsert_candles(sb, rows)
 
-                    kept_ts = {parse_ts(r["ts"]).replace(second=0, microsecond=0) for r in rows if r.get("ts")}
-                    cursor = last_saved.replace(second=0, microsecond=0)
-                    advanced = 0
-                    while True:
-                        nxt = cursor + timedelta(minutes=1)
-                        if nxt in kept_ts:
-                            cursor = nxt
-                            advanced += 1
-                            continue
-                        break
+                    # Watermark cursor update:
+                    # Advance to the newest minute we successfully wrote, even if there are gaps.
+                    # Gaps are handled by integrity/repair separately; otherwise the cursor can get "stuck"
+                    # and repeatedly upsert a large window (e.g., "LIVE wrote 614 rows" every loop).
+                    old_last = last_saved.replace(second=0, microsecond=0)
+                    kept_ts = {
+                        parse_ts(r["ts"]).replace(second=0, microsecond=0)
+                        for r in rows
+                        if r.get("ts")
+                    }
+                    max_ts = max(kept_ts) if kept_ts else old_last
 
-                    if advanced > 0:
-                        last_saved = cursor
+                    if max_ts > old_last:
+                        # Optional gap signal (does not block progress)
+                        expected = int((max_ts - old_last).total_seconds() / 60)
+                        actual = sum(1 for t in kept_ts if t > old_last)
+                        if actual < expected:
+                            print(f"[AUTO] LIVE wrote {len(rows)} rows; gaps detected; watermark->{iso_z(max_ts)}")
+                        else:
+                            print(f"[AUTO] LIVE wrote {len(rows)} rows; watermark->{iso_z(max_ts)}")
+
+                        last_saved = max_ts
                         set_state_last_ts(sb, iso_z(last_saved))
-                        print(f"[AUTO] LIVE wrote {len(rows)} rows; advanced {advanced}m; last_ts={iso_z(last_saved)}")
                     else:
-                        print(f"[AUTO] LIVE wrote {len(rows)} rows; gap detected after {iso_z(last_saved)}")
+                        print(f"[AUTO] LIVE wrote {len(rows)} rows; no watermark advance; last_ts={iso_z(old_last)}")
 
             # Periodic derived rebuild (recent days only)
             now_s = time.time()
             if now_s - last_rebuild >= AUTO_REBUILD_EVERY_SECONDS:
                 last_rebuild = now_s
-                global BUILD_DAYS_BACK
+                global BUILD_DAYS_BACK, BUILD_VERIFY_COMPLETE
                 prev = BUILD_DAYS_BACK
+                prev_verify = BUILD_VERIFY_COMPLETE
                 try:
                     BUILD_DAYS_BACK = int(AUTO_REBUILD_DAYS_BACK)
+                    # Allow partial-day builds during live operation so today's 3m/5m/15m/1h candles update.
+                    BUILD_VERIFY_COMPLETE = False
                     run_build_intraday_tfs(sb)
                 finally:
                     BUILD_DAYS_BACK = prev
+                    BUILD_VERIFY_COMPLETE = prev_verify
 
             # Periodic lightweight history/coverage check (min/max only)
             if now_s - last_history_check >= AUTO_HISTORY_CHECK_SECONDS:
@@ -1315,27 +1327,28 @@ def run_live(sb: Client) -> None:
                     rows = normalize_rows(candidate_bars)
                     upsert_candles(sb, rows)
 
+                    # Watermark cursor update (same logic as AUTO loop):
+                    # advance to newest written ts even if gaps exist, to prevent repeated bulk upserts.
+                    old_last = last_saved.replace(second=0, microsecond=0)
                     kept_ts = {
                         parse_ts(r["ts"]).replace(second=0, microsecond=0)
                         for r in rows
                         if r.get("ts")
                     }
-                    cursor = last_saved.replace(second=0, microsecond=0)
-                    advanced = 0
-                    while True:
-                        nxt = cursor + timedelta(minutes=1)
-                        if nxt in kept_ts:
-                            cursor = nxt
-                            advanced += 1
-                            continue
-                        break
+                    max_ts = max(kept_ts) if kept_ts else old_last
 
-                    if advanced > 0:
-                        last_saved = cursor
+                    if max_ts > old_last:
+                        expected = int((max_ts - old_last).total_seconds() / 60)
+                        actual = sum(1 for t in kept_ts if t > old_last)
+                        if actual < expected:
+                            print(f"[LIVE] wrote {len(rows)} rows; gaps detected; watermark->{iso_z(max_ts)}")
+                        else:
+                            print(f"[LIVE] wrote {len(rows)} rows; watermark->{iso_z(max_ts)}")
+
+                        last_saved = max_ts
                         set_state_last_ts(sb, iso_z(last_saved))
-                        print(f"[LIVE] wrote {len(rows)} rows; advanced {advanced}m; last_ts={iso_z(last_saved)}")
                     else:
-                        print(f"[LIVE] wrote {len(rows)} rows; gap detected after {iso_z(last_saved)}")
+                        print(f"[LIVE] wrote {len(rows)} rows; no watermark advance; last_ts={iso_z(old_last)}")
 
             tf_key = STATE_TIMEFRAME_KEY or _infer_timeframe_key()
             if ENABLE_INTEGRITY and tf_key == "1m":
