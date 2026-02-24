@@ -1,6 +1,8 @@
 """
 main.py — Alpaca -> Supabase candle ingestion with robust pagination support.
 
+Adds AUTO orchestration for 1m + derived intraday + 1d/1w (Alpaca direct) with no env changes.
+
 AUTO mode orchestrates backfill + derived TF build + live updates with no env tweaking.
 Supports modes:
   MODE=backfill   : Backfill from now back to YEARS_BACK (default 2 years), then exit.
@@ -62,6 +64,8 @@ TABLE_3M = os.environ.get("TABLE_3M", "candle_history_3m")
 TABLE_5M = os.environ.get("TABLE_5M", "candle_history_5m")
 TABLE_15M = os.environ.get("TABLE_15M", "candle_history_15m")
 TABLE_1H = os.environ.get("TABLE_1H", "candle_history_1h")
+TABLE_1D = os.environ.get("TABLE_1D", "candle_history_1d")
+TABLE_1W = os.environ.get("TABLE_1W", "candle_history_1w")
 
 # Build controls
 BUILD_DAYS_BACK = int(os.environ.get("BUILD_DAYS_BACK", "3"))  # used by MODE=build_intraday_tfs
@@ -88,6 +92,10 @@ AUTO_REBUILD_DAYS_BACK = int(os.environ.get("AUTO_REBUILD_DAYS_BACK", "3"))  # r
 AUTO_FULL_BUILD_DAYS_BACK = int(
     os.environ.get("AUTO_FULL_BUILD_DAYS_BACK", str(int(365 * float(os.environ.get("YEARS_BACK", "2")))))
 )
+
+# 1D/1W auto refresh cadence while service runs
+AUTO_DAILY_REFRESH_SECONDS = int(os.environ.get("AUTO_DAILY_REFRESH_SECONDS", "3600"))  # 1 hour
+AUTO_WEEKLY_REFRESH_SECONDS = int(os.environ.get("AUTO_WEEKLY_REFRESH_SECONDS", "21600"))  # 6 hours
 
 VERIFY_AFTER_BACKFILL = os.environ.get("VERIFY_AFTER_BACKFILL", "1") == "1"
 
@@ -177,6 +185,46 @@ def alpaca_get_bars(
     """Fetch bars for [start, end], optionally following next_page_token."""
     base_params = {
         "timeframe": TIMEFRAME,
+        "start": iso_z(start_ts_utc),
+        "end": iso_z(end_ts_utc),
+        "limit": limit,
+        "adjustment": ADJUSTMENT,
+        "feed": ALPACA_FEED,
+    }
+
+    bars: List[Dict[str, Any]] = []
+    payload = _alpaca_request(base_params)
+    bars.extend(payload.get("bars", []) or [])
+    next_token = payload.get("next_page_token")
+
+    if not fetch_all_pages:
+        return bars
+
+    loops = 0
+    while next_token and loops < MAX_PAGE_LOOPS:
+        loops += 1
+        params = dict(base_params)
+        params["page_token"] = next_token
+        payload = _alpaca_request(params)
+        bars.extend(payload.get("bars", []) or [])
+        next_token = payload.get("next_page_token")
+        time.sleep(API_SLEEP_SECONDS)
+
+    return bars
+
+
+def alpaca_get_bars_tf(
+    timeframe: str,
+    start_ts_utc: datetime,
+    end_ts_utc: datetime,
+    limit: int = 4000,
+    fetch_all_pages: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Same as alpaca_get_bars(), but allows overriding timeframe per call (needed for 1Day/1Week while main runs 1Min).
+    """
+    base_params = {
+        "timeframe": timeframe,
         "start": iso_z(start_ts_utc),
         "end": iso_z(end_ts_utc),
         "limit": limit,
@@ -306,6 +354,30 @@ def get_state_last_ts(sb: Client) -> Optional[str]:
 
 def set_state_last_ts(sb: Client, last_ts: Optional[str]) -> None:
     tf_key = STATE_TIMEFRAME_KEY or _infer_timeframe_key()
+    payload = {
+        "symbol": SYMBOL,
+        "timeframe": tf_key,
+        "last_ts": last_ts,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sb.table(TABLE_STATE).upsert(payload, on_conflict="symbol,timeframe").execute()
+
+
+def get_state_last_ts_for(sb: Client, tf_key: str) -> Optional[str]:
+    resp = (
+        sb.table(TABLE_STATE)
+        .select("last_ts")
+        .eq("symbol", SYMBOL)
+        .eq("timeframe", tf_key)
+        .limit(1)
+        .execute()
+    )
+    if resp.data and resp.data[0].get("last_ts"):
+        return resp.data[0]["last_ts"]
+    return None
+
+
+def set_state_last_ts_for(sb: Client, tf_key: str, last_ts: Optional[str]) -> None:
     payload = {
         "symbol": SYMBOL,
         "timeframe": tf_key,
@@ -707,10 +779,89 @@ def run_auto(sb: Client) -> None:
     Full automation:
       1) Ensure 1m history (backfill if needed)
       2) Ensure derived TF history (build full range if needed)
-      3) Enter live loop; periodically rebuild derived TFs for recent days
+      3) Ensure 1D/1W history (direct from Alpaca)
+      4) Enter live loop; periodically rebuild derived TFs and refresh 1D/1W
     """
     print(f"[AUTO] starting automation for {SYMBOL}")
     print(f"[AUTO] 1m table={TABLE_CANDLES}, source_1m={TABLE_1M_SOURCE}")
+
+    def _rows_from_higher_tf_bars(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for b in sorted(bars, key=lambda x: x["t"]):
+            rows.append(
+                {
+                    "symbol": SYMBOL,
+                    "ts": b["t"],
+                    "session": "all",
+                    "open": float(b["o"]),
+                    "high": float(b["h"]),
+                    "low": float(b["l"]),
+                    "close": float(b["c"]),
+                    "volume": float(b.get("v") or 0),
+                    "vwap": float(b.get("vw") or 0) if b.get("vw") is not None else None,
+                    "trade_count": int(b.get("n") or 0),
+                }
+            )
+        return rows
+
+    def _ensure_1d_1w_history() -> None:
+        now_utc, cutoff_utc = _cutoff_now_utc()
+        print(f"[AUTO] ensure 1D/1W history (need earliest <= {iso_z(cutoff_utc)})")
+
+        if not _has_required_history(sb, TABLE_1D):
+            print(f"[AUTO] 1D missing history in {TABLE_1D}; backfilling from Alpaca...")
+            bars = alpaca_get_bars_tf("1Day", cutoff_utc, now_utc, limit=LIMIT, fetch_all_pages=True)
+            rows = _rows_from_higher_tf_bars(bars)
+            if rows:
+                for batch in chunked(rows, UPSERT_CHUNK):
+                    sb.table(TABLE_1D).upsert(batch, on_conflict="symbol,ts").execute()
+                newest = rows[-1]["ts"]
+                set_state_last_ts_for(sb, "1d", newest)
+                print(f"[AUTO] 1D backfill wrote {len(rows)} rows; state(1d)={newest}")
+        else:
+            mx = get_table_max_ts(sb, TABLE_1D)
+            if mx:
+                set_state_last_ts_for(sb, "1d", mx)
+                print(f"[AUTO] 1D history OK; state(1d)={mx}")
+
+        if not _has_required_history(sb, TABLE_1W):
+            print(f"[AUTO] 1W missing history in {TABLE_1W}; backfilling from Alpaca...")
+            bars = alpaca_get_bars_tf("1Week", cutoff_utc, now_utc, limit=LIMIT, fetch_all_pages=True)
+            rows = _rows_from_higher_tf_bars(bars)
+            if rows:
+                for batch in chunked(rows, UPSERT_CHUNK):
+                    sb.table(TABLE_1W).upsert(batch, on_conflict="symbol,ts").execute()
+                newest = rows[-1]["ts"]
+                set_state_last_ts_for(sb, "1w", newest)
+                print(f"[AUTO] 1W backfill wrote {len(rows)} rows; state(1w)={newest}")
+        else:
+            mx = get_table_max_ts(sb, TABLE_1W)
+            if mx:
+                set_state_last_ts_for(sb, "1w", mx)
+                print(f"[AUTO] 1W history OK; state(1w)={mx}")
+
+    def _refresh_1d_1w_incremental(now_utc: datetime) -> None:
+        last_1d = get_state_last_ts_for(sb, "1d")
+        start_1d = parse_ts(last_1d) + timedelta(seconds=1) if last_1d else now_utc - timedelta(days=int(365 * YEARS_BACK))
+        bars_d = alpaca_get_bars_tf("1Day", start_1d, now_utc, limit=LIMIT, fetch_all_pages=True)
+        if bars_d:
+            rows = _rows_from_higher_tf_bars(bars_d)
+            for batch in chunked(rows, UPSERT_CHUNK):
+                sb.table(TABLE_1D).upsert(batch, on_conflict="symbol,ts").execute()
+            newest = rows[-1]["ts"]
+            set_state_last_ts_for(sb, "1d", newest)
+            print(f"[AUTO] 1D refresh wrote {len(rows)} rows; state(1d)={newest}")
+
+        last_1w = get_state_last_ts_for(sb, "1w")
+        start_1w = parse_ts(last_1w) + timedelta(seconds=1) if last_1w else now_utc - timedelta(days=int(365 * YEARS_BACK))
+        bars_w = alpaca_get_bars_tf("1Week", start_1w, now_utc, limit=LIMIT, fetch_all_pages=True)
+        if bars_w:
+            rows = _rows_from_higher_tf_bars(bars_w)
+            for batch in chunked(rows, UPSERT_CHUNK):
+                sb.table(TABLE_1W).upsert(batch, on_conflict="symbol,ts").execute()
+            newest = rows[-1]["ts"]
+            set_state_last_ts_for(sb, "1w", newest)
+            print(f"[AUTO] 1W refresh wrote {len(rows)} rows; state(1w)={newest}")
 
     # Step 1: Ensure 1m history
     _ensure_1m_history(sb)
@@ -718,9 +869,14 @@ def run_auto(sb: Client) -> None:
     # Step 2: Ensure derived history once
     _ensure_intraday_derived_history(sb)
 
+    # Step 2b: Ensure 1D/1W history once (Alpaca direct)
+    _ensure_1d_1w_history()
+
     # Step 3: Live + periodic builder
     print("[AUTO] entering live mode with periodic derived rebuilds...")
     last_rebuild = 0.0
+    last_daily_refresh = 0.0
+    last_weekly_refresh = 0.0
 
     # We re-use live logic but embed periodic derived rebuilds inside the loop.
     # Implemented by running a small "live loop" here instead of calling run_live(), to avoid refactoring.
@@ -789,6 +945,14 @@ def run_auto(sb: Client) -> None:
                     run_build_intraday_tfs(sb)
                 finally:
                     BUILD_DAYS_BACK = prev
+
+            # Periodic 1D/1W refresh (Alpaca direct)
+            if now_s - last_daily_refresh >= AUTO_DAILY_REFRESH_SECONDS:
+                last_daily_refresh = now_s
+                _refresh_1d_1w_incremental(now_utc)
+            elif now_s - last_weekly_refresh >= AUTO_WEEKLY_REFRESH_SECONDS:
+                last_weekly_refresh = now_s
+                _refresh_1d_1w_incremental(now_utc)
 
             # Optional integrity check/repair stays in place for 1m
             tf_key = STATE_TIMEFRAME_KEY or _infer_timeframe_key()
