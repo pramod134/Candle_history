@@ -1,6 +1,7 @@
 """
 main.py — Alpaca -> Supabase candle ingestion with robust pagination support.
 
+AUTO mode orchestrates backfill + derived TF build + live updates with no env tweaking.
 Supports modes:
   MODE=backfill   : Backfill from now back to YEARS_BACK (default 2 years), then exit.
                    Auto-skips if DB already contains >= YEARS_BACK of history (earliest_ts <= cutoff).
@@ -66,7 +67,7 @@ TABLE_1H = os.environ.get("TABLE_1H", "candle_history_1h")
 BUILD_DAYS_BACK = int(os.environ.get("BUILD_DAYS_BACK", "3"))  # used by MODE=build_intraday_tfs
 BUILD_VERIFY_COMPLETE = os.environ.get("BUILD_VERIFY_COMPLETE", "1") == "1"  # require 390 1m RTH mins
 
-MODE = os.environ.get("MODE", "backfill").lower()  # backfill | live | daily_once | weekly_once | build_intraday_tfs
+MODE = os.environ.get("MODE", "auto").lower()  # auto | backfill | live | daily_once | weekly_once | build_intraday_tfs
 
 ALPACA_FEED = os.environ.get("ALPACA_FEED", "iex")
 TIMEFRAME = os.environ.get("TIMEFRAME", "1Min")
@@ -80,6 +81,13 @@ UPSERT_CHUNK = int(os.environ.get("UPSERT_CHUNK", "500"))
 
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "20"))
 LIVE_LOOKBACK_MIN = int(os.environ.get("LIVE_LOOKBACK_MIN", "120"))
+
+# AUTO orchestration knobs (defaults require no env changes)
+AUTO_REBUILD_EVERY_SECONDS = int(os.environ.get("AUTO_REBUILD_EVERY_SECONDS", "300"))  # rebuild derived TFs every 5m
+AUTO_REBUILD_DAYS_BACK = int(os.environ.get("AUTO_REBUILD_DAYS_BACK", "3"))  # rebuild last N days in live
+AUTO_FULL_BUILD_DAYS_BACK = int(
+    os.environ.get("AUTO_FULL_BUILD_DAYS_BACK", str(int(365 * float(os.environ.get("YEARS_BACK", "2")))))
+)
 
 VERIFY_AFTER_BACKFILL = os.environ.get("VERIFY_AFTER_BACKFILL", "1") == "1"
 
@@ -257,6 +265,30 @@ def get_db_max_ts(sb: Client) -> Optional[str]:
     return resp.data[0]["ts"] if resp.data else None
 
 
+def get_table_min_ts(sb: Client, table: str) -> Optional[str]:
+    resp = (
+        sb.table(table)
+        .select("ts")
+        .eq("symbol", SYMBOL)
+        .order("ts", desc=False)
+        .limit(1)
+        .execute()
+    )
+    return resp.data[0]["ts"] if resp.data else None
+
+
+def get_table_max_ts(sb: Client, table: str) -> Optional[str]:
+    resp = (
+        sb.table(table)
+        .select("ts")
+        .eq("symbol", SYMBOL)
+        .order("ts", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return resp.data[0]["ts"] if resp.data else None
+
+
 def get_state_last_ts(sb: Client) -> Optional[str]:
     tf_key = STATE_TIMEFRAME_KEY or _infer_timeframe_key()
     resp = (
@@ -306,7 +338,7 @@ def verify_rth_day(sb: Client, et_date: datetime.date) -> Tuple[bool, List[str],
     expected_count = len(expected)
 
     resp = (
-        sb.table(TABLE_CANDLES)
+        sb.table(TABLE_1M_SOURCE)
         .select("ts")
         .eq("symbol", SYMBOL)
         .eq("session", "rth")
@@ -593,6 +625,200 @@ def run_build_intraday_tfs(sb: Client) -> None:
 
 
 # =============================
+# AUTO ORCHESTRATION
+# =============================
+def _cutoff_now_utc() -> Tuple[datetime, datetime]:
+    now_utc = datetime.now(timezone.utc) - timedelta(minutes=BACKFILL_END_DELAY_MIN)
+    cutoff_utc = now_utc - timedelta(days=int(365 * YEARS_BACK))
+    return now_utc, cutoff_utc
+
+
+def _has_required_history(sb: Client, table: str) -> bool:
+    """
+    History is considered present if earliest ts <= cutoff_utc.
+    """
+    _now, cutoff_utc = _cutoff_now_utc()
+    mn = get_table_min_ts(sb, table)
+    if not mn:
+        return False
+    try:
+        return parse_ts(mn) <= cutoff_utc
+    except Exception:
+        return False
+
+
+def _ensure_1m_history(sb: Client) -> None:
+    """
+    Ensures 2y history exists in TABLE_CANDLES (default candle_history_1m).
+    If missing, runs backfill; else sets state cursor to DB max ts.
+    """
+    now_utc, cutoff_utc = _cutoff_now_utc()
+    print(f"[AUTO] ensure 1m history in {TABLE_CANDLES} (need earliest <= {iso_z(cutoff_utc)})")
+
+    if _has_required_history(sb, TABLE_CANDLES):
+        mx = get_db_max_ts(sb)
+        if mx:
+            set_state_last_ts(sb, mx)
+            print(f"[AUTO] 1m history OK; state cursor set to DB max {mx}")
+        else:
+            # no rows but history check says OK shouldn't happen; fall back
+            set_state_last_ts(sb, iso_z(now_utc - timedelta(minutes=LIVE_LOOKBACK_MIN)))
+            print("[AUTO] 1m history check inconsistent; seeded cursor with lookback.")
+        return
+
+    print("[AUTO] 1m history missing; running backfill now...")
+    run_backfill(sb)
+
+
+def _ensure_intraday_derived_history(sb: Client) -> None:
+    """
+    If derived tables are missing 2y history, build full range once from 1m source.
+    """
+    print("[AUTO] ensure derived TF history (3m/5m/15m/1h) from 1m source")
+    need_full = False
+    for t in (TABLE_3M, TABLE_5M, TABLE_15M, TABLE_1H):
+        if not _has_required_history(sb, t):
+            print(f"[AUTO] derived table missing history: {t}")
+            need_full = True
+
+    if not need_full:
+        print("[AUTO] derived TF history OK")
+        return
+
+    # Full build: temporarily override BUILD_DAYS_BACK via local loop rather than env
+    print(f"[AUTO] running full derived build for {AUTO_FULL_BUILD_DAYS_BACK} days back...")
+    global BUILD_DAYS_BACK
+    prev = BUILD_DAYS_BACK
+    global BUILD_VERIFY_COMPLETE
+    prev_verify = BUILD_VERIFY_COMPLETE
+    try:
+        BUILD_DAYS_BACK = int(AUTO_FULL_BUILD_DAYS_BACK)
+        # For first-time build, don't block on strict completeness; incomplete days will still aggregate what's present.
+        # (Integrity repair can fill gaps later.)
+        BUILD_VERIFY_COMPLETE = False
+        run_build_intraday_tfs(sb)
+    finally:
+        BUILD_DAYS_BACK = prev
+        BUILD_VERIFY_COMPLETE = prev_verify
+
+
+def run_auto(sb: Client) -> None:
+    """
+    Full automation:
+      1) Ensure 1m history (backfill if needed)
+      2) Ensure derived TF history (build full range if needed)
+      3) Enter live loop; periodically rebuild derived TFs for recent days
+    """
+    print(f"[AUTO] starting automation for {SYMBOL}")
+    print(f"[AUTO] 1m table={TABLE_CANDLES}, source_1m={TABLE_1M_SOURCE}")
+
+    # Step 1: Ensure 1m history
+    _ensure_1m_history(sb)
+
+    # Step 2: Ensure derived history once
+    _ensure_intraday_derived_history(sb)
+
+    # Step 3: Live + periodic builder
+    print("[AUTO] entering live mode with periodic derived rebuilds...")
+    last_rebuild = 0.0
+
+    # We re-use live logic but embed periodic derived rebuilds inside the loop.
+    # Implemented by running a small "live loop" here instead of calling run_live(), to avoid refactoring.
+    state_ts = get_state_last_ts(sb)
+    if state_ts:
+        last_saved = parse_ts(state_ts)
+        print(f"[AUTO] loaded cursor from state: {state_ts}")
+    else:
+        db_max = get_db_max_ts(sb)
+        if db_max:
+            last_saved = parse_ts(db_max)
+            print(f"[AUTO] no state; using DB max: {db_max}")
+        else:
+            last_saved = datetime.now(timezone.utc) - timedelta(minutes=LIVE_LOOKBACK_MIN)
+            print(f"[AUTO] no state and no DB data; using lookback cursor: {iso_z(last_saved)}")
+        set_state_last_ts(sb, iso_z(last_saved))
+
+    last_integrity_check = 0.0
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc) - timedelta(minutes=LIVE_END_DELAY_MIN)
+            start = last_saved - timedelta(minutes=2)
+            end = now_utc
+
+            bars = alpaca_get_bars(start_ts_utc=start, end_ts_utc=end, limit=LIMIT, fetch_all_pages=FETCH_ALL_PAGES)
+            if bars:
+                bars_sorted = sorted(bars, key=lambda x: x["t"])
+                candidate_bars: List[Dict[str, Any]] = []
+                for b in bars_sorted:
+                    ts = parse_ts(b["t"]).replace(second=0, microsecond=0)
+                    if ts <= last_saved.replace(second=0, microsecond=0):
+                        continue
+                    candidate_bars.append(b)
+
+                if candidate_bars:
+                    rows = normalize_rows(candidate_bars)
+                    upsert_candles(sb, rows)
+
+                    kept_ts = {parse_ts(r["ts"]).replace(second=0, microsecond=0) for r in rows if r.get("ts")}
+                    cursor = last_saved.replace(second=0, microsecond=0)
+                    advanced = 0
+                    while True:
+                        nxt = cursor + timedelta(minutes=1)
+                        if nxt in kept_ts:
+                            cursor = nxt
+                            advanced += 1
+                            continue
+                        break
+
+                    if advanced > 0:
+                        last_saved = cursor
+                        set_state_last_ts(sb, iso_z(last_saved))
+                        print(f"[AUTO] LIVE wrote {len(rows)} rows; advanced {advanced}m; last_ts={iso_z(last_saved)}")
+                    else:
+                        print(f"[AUTO] LIVE wrote {len(rows)} rows; gap detected after {iso_z(last_saved)}")
+
+            # Periodic derived rebuild (recent days only)
+            now_s = time.time()
+            if now_s - last_rebuild >= AUTO_REBUILD_EVERY_SECONDS:
+                last_rebuild = now_s
+                global BUILD_DAYS_BACK
+                prev = BUILD_DAYS_BACK
+                try:
+                    BUILD_DAYS_BACK = int(AUTO_REBUILD_DAYS_BACK)
+                    run_build_intraday_tfs(sb)
+                finally:
+                    BUILD_DAYS_BACK = prev
+
+            # Optional integrity check/repair stays in place for 1m
+            tf_key = STATE_TIMEFRAME_KEY or _infer_timeframe_key()
+            if ENABLE_INTEGRITY and tf_key == "1m":
+                if now_s - last_integrity_check >= 300:
+                    last_integrity_check = now_s
+                    for d in range(INTEGRITY_LOOKBACK_DAYS):
+                        et_day = (datetime.now(ET) - timedelta(days=d)).date()
+                        ok, missing, expected, actual = verify_rth_day(sb, et_day)
+                        _upsert_integrity_row(sb, et_day, ok, missing, expected, actual)
+                        if ok:
+                            print(f"[INTEGRITY] {et_day} OK ({actual}/{expected})")
+                            continue
+                        print(f"[INTEGRITY] {et_day} MISSING {len(missing)} minutes ({actual}/{expected})")
+                        if INTEGRITY_REPAIR and missing:
+                            fetched = repair_missing_minutes(sb, missing)
+                            ok2, missing2, expected2, actual2 = verify_rth_day(sb, et_day)
+                            _upsert_integrity_row(sb, et_day, ok2, missing2, expected2, actual2)
+                            print(
+                                f"[INTEGRITY] repair fetched={fetched} -> "
+                                f"ok={ok2} missing={len(missing2)} ({actual2}/{expected2})"
+                            )
+
+        except Exception as e:
+            print(f"[AUTO] ERROR: {e}")
+
+        time.sleep(POLL_SECONDS)
+
+
+# =============================
 # BACKFILL
 # =============================
 def _compute_backfill_window(end_cursor: datetime) -> Tuple[datetime, datetime]:
@@ -826,7 +1052,9 @@ def main():
 
     sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    if MODE == "backfill":
+    if MODE == "auto":
+        run_auto(sb)
+    elif MODE == "backfill":
         run_backfill(sb)
     elif MODE == "live":
         run_live(sb)
@@ -835,7 +1063,7 @@ def main():
     elif MODE == "build_intraday_tfs":
         run_build_intraday_tfs(sb)
     else:
-        raise SystemExit("MODE must be 'backfill', 'live', 'daily_once', 'weekly_once', or 'build_intraday_tfs'.")
+        raise SystemExit("MODE must be 'auto', 'backfill', 'live', 'daily_once', 'weekly_once', or 'build_intraday_tfs'.")
 
 
 if __name__ == "__main__":
