@@ -94,6 +94,9 @@ AUTO_FULL_BUILD_DAYS_BACK = int(
     os.environ.get("AUTO_FULL_BUILD_DAYS_BACK", str(int(365 * float(os.environ.get("YEARS_BACK", "2")))))
 )
 
+# Lightweight min/max coverage check cadence (no candle counting)
+AUTO_HISTORY_CHECK_SECONDS = int(os.environ.get("AUTO_HISTORY_CHECK_SECONDS", "600"))  # 10 minutes
+
 # Derived-history detection tolerance (prevents unnecessary full rebuilds after restart)
 # - min ts can be slightly newer than cutoff due to RTH-only anchors, holidays, etc.
 # - max ts must be "fresh enough" compared to 1m max.
@@ -900,8 +903,9 @@ def run_auto(sb: Client) -> None:
     Full automation:
       1) Ensure 1m history (backfill if needed)
       2) Ensure derived TF history (build full range if needed)
-      3) Ensure 1D/1W history (direct from Alpaca)
-      4) Enter live loop; periodically rebuild derived TFs and refresh 1D/1W
+      2b) Ensure 1D/1W history (Alpaca direct; tolerant+freshness)
+      3) Enter live loop; periodically rebuild derived TFs for recent days
+      4) Every AUTO_HISTORY_CHECK_SECONDS, re-run lightweight history checks (min/max coverage only)
     """
     print(f"[AUTO] starting automation for {SYMBOL}")
     print(f"[AUTO] 1m table={TABLE_CANDLES}, source_1m={TABLE_1M_SOURCE}")
@@ -984,6 +988,66 @@ def run_auto(sb: Client) -> None:
             set_state_last_ts_for(sb, "1w", newest)
             print(f"[AUTO] 1W refresh wrote {len(rows)} rows; state(1w)={newest}")
 
+    def _auto_history_check(now_utc: datetime) -> None:
+        """
+        Lightweight periodic health/coverage check (min/max only).
+        - No counting candles.
+        - Repairs only when a table looks incomplete/stale.
+        """
+        _, cutoff_utc = _cutoff_now_utc()
+        print(f"[AUTO][HIST] running coverage check (cutoff={iso_z(cutoff_utc)})")
+
+        # 1) 1m coverage (strict min_ts vs cutoff)
+        if not _has_required_history(sb, TABLE_CANDLES):
+            print("[AUTO][HIST] 1m coverage not OK -> running backfill")
+            run_backfill(sb)
+        else:
+            # keep state cursor aligned with latest
+            mx_1m = get_table_max_ts(sb, TABLE_CANDLES)
+            if mx_1m:
+                set_state_last_ts(sb, mx_1m)
+                print(f"[AUTO][HIST] 1m OK; state cursor set to {mx_1m}")
+
+        # 2) Derived intraday TFs coverage (tolerant + freshness)
+        derived_bad = []
+        for t in (TABLE_3M, TABLE_5M, TABLE_15M, TABLE_1H):
+            if not _derived_history_ok(sb, t):
+                derived_bad.append(t)
+        if derived_bad:
+            print(f"[AUTO][HIST] derived tables not OK -> full rebuild: {derived_bad}")
+            # Full derived build, non-blocking on completeness (same as startup behavior)
+            global BUILD_DAYS_BACK, BUILD_VERIFY_COMPLETE
+            prev_days = BUILD_DAYS_BACK
+            prev_verify = BUILD_VERIFY_COMPLETE
+            try:
+                BUILD_DAYS_BACK = int(AUTO_FULL_BUILD_DAYS_BACK)
+                BUILD_VERIFY_COMPLETE = False
+                run_build_intraday_tfs(sb)
+            finally:
+                BUILD_DAYS_BACK = prev_days
+                BUILD_VERIFY_COMPLETE = prev_verify
+        else:
+            print("[AUTO][HIST] derived TF tables OK")
+
+        # 3) 1D/1W coverage (tolerant + freshness)
+        if not _htf_history_ok(sb, TABLE_1D, DAILY_HISTORY_TOL_DAYS):
+            print("[AUTO][HIST] 1D not OK -> backfill/repair via ensure_1d_1w_history()")
+            _ensure_1d_1w_history()
+        else:
+            mx_1d = get_table_max_ts(sb, TABLE_1D)
+            if mx_1d:
+                set_state_last_ts_for(sb, "1d", mx_1d)
+            print("[AUTO][HIST] 1D OK")
+
+        if not _htf_history_ok(sb, TABLE_1W, WEEKLY_HISTORY_TOL_DAYS):
+            print("[AUTO][HIST] 1W not OK -> backfill/repair via ensure_1d_1w_history()")
+            _ensure_1d_1w_history()
+        else:
+            mx_1w = get_table_max_ts(sb, TABLE_1W)
+            if mx_1w:
+                set_state_last_ts_for(sb, "1w", mx_1w)
+            print("[AUTO][HIST] 1W OK")
+
     # Step 1: Ensure 1m history
     _ensure_1m_history(sb)
 
@@ -996,6 +1060,7 @@ def run_auto(sb: Client) -> None:
     # Step 3: Live + periodic builder
     print("[AUTO] entering live mode with periodic derived rebuilds...")
     last_rebuild = 0.0
+    last_history_check = 0.0
     last_daily_refresh = 0.0
     last_weekly_refresh = 0.0
 
@@ -1066,6 +1131,14 @@ def run_auto(sb: Client) -> None:
                     run_build_intraday_tfs(sb)
                 finally:
                     BUILD_DAYS_BACK = prev
+
+            # Periodic lightweight history/coverage check (min/max only)
+            if now_s - last_history_check >= AUTO_HISTORY_CHECK_SECONDS:
+                last_history_check = now_s
+                try:
+                    _auto_history_check(now_utc)
+                except Exception as e:
+                    print(f"[AUTO][HIST] ERROR: {e}")
 
             # Periodic 1D/1W refresh (Alpaca direct)
             if now_s - last_daily_refresh >= AUTO_DAILY_REFRESH_SECONDS:
