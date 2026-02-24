@@ -1,6 +1,7 @@
 """
 main.py — Alpaca -> Supabase candle ingestion with robust pagination support.
 
+Patch: prevent full derived rebuilds after restart by using tolerant + freshness checks for derived TF tables.
 Adds AUTO orchestration for 1m + derived intraday + 1d/1w (Alpaca direct) with no env changes.
 
 AUTO mode orchestrates backfill + derived TF build + live updates with no env tweaking.
@@ -92,6 +93,12 @@ AUTO_REBUILD_DAYS_BACK = int(os.environ.get("AUTO_REBUILD_DAYS_BACK", "3"))  # r
 AUTO_FULL_BUILD_DAYS_BACK = int(
     os.environ.get("AUTO_FULL_BUILD_DAYS_BACK", str(int(365 * float(os.environ.get("YEARS_BACK", "2")))))
 )
+
+# Derived-history detection tolerance (prevents unnecessary full rebuilds after restart)
+# - min ts can be slightly newer than cutoff due to RTH-only anchors, holidays, etc.
+# - max ts must be "fresh enough" compared to 1m max.
+DERIVED_HISTORY_TOL_DAYS = int(os.environ.get("DERIVED_HISTORY_TOL_DAYS", "7"))
+DERIVED_STALE_DAYS = int(os.environ.get("DERIVED_STALE_DAYS", "3"))
 
 # 1D/1W auto refresh cadence while service runs
 AUTO_DAILY_REFRESH_SECONDS = int(os.environ.get("AUTO_DAILY_REFRESH_SECONDS", "3600"))  # 1 hour
@@ -719,6 +726,55 @@ def _has_required_history(sb: Client, table: str) -> bool:
         return False
 
 
+def _derived_history_ok(sb: Client, table: str) -> bool:
+    """
+    Tolerant + freshness-based check for derived TF tables (3m/5m/15m/1h), to avoid full rebuilds after restart.
+
+    OK when:
+      - table has data
+      - min_ts is not "too new" relative to cutoff (within tolerance window)
+      - max_ts is not stale compared to 1m max (within stale window)
+
+    Rationale:
+      Derived TFs are RTH-only and anchored to 09:30 ET, so their first bar can be later than the exact cutoff time.
+      Also holidays/early closes can affect earliest available derived candle.
+    """
+    _now_utc, cutoff_utc = _cutoff_now_utc()
+
+    mn = get_table_min_ts(sb, table)
+    mx = get_table_max_ts(sb, table)
+    if not mn or not mx:
+        return False
+
+    try:
+        mn_dt = parse_ts(mn)
+        mx_dt = parse_ts(mx)
+    except Exception:
+        return False
+
+    # 1) Min tolerance: allow derived min to be newer than cutoff by N days
+    tol_cutoff = cutoff_utc + timedelta(days=int(DERIVED_HISTORY_TOL_DAYS))
+    if mn_dt > tol_cutoff:
+        return False
+
+    # 2) Freshness: derived max should be close to 1m max (or at least not stale)
+    src_max = get_table_max_ts(sb, TABLE_1M_SOURCE) or get_table_max_ts(sb, TABLE_CANDLES)
+    if not src_max:
+        # If we can't determine 1m freshness, treat as OK if it has any data and min is within tolerance.
+        return True
+
+    try:
+        src_max_dt = parse_ts(src_max)
+    except Exception:
+        return True
+
+    stale_floor = src_max_dt - timedelta(days=int(DERIVED_STALE_DAYS))
+    if mx_dt < stale_floor:
+        return False
+
+    return True
+
+
 def _ensure_1m_history(sb: Client) -> None:
     """
     Ensures 2y history exists in TABLE_CANDLES (default candle_history_1m).
@@ -747,10 +803,12 @@ def _ensure_intraday_derived_history(sb: Client) -> None:
     If derived tables are missing 2y history, build full range once from 1m source.
     """
     print("[AUTO] ensure derived TF history (3m/5m/15m/1h) from 1m source")
+    # Use tolerant + freshness-based check for derived TFs to prevent unnecessary rebuilds.
     need_full = False
     for t in (TABLE_3M, TABLE_5M, TABLE_15M, TABLE_1H):
-        if not _has_required_history(sb, t):
-            print(f"[AUTO] derived table missing history: {t}")
+        ok = _derived_history_ok(sb, t)
+        if not ok:
+            print(f"[AUTO] derived table not OK (will rebuild): {t}")
             need_full = True
 
     if not need_full:
