@@ -53,7 +53,20 @@ TABLE_STATE = os.environ.get("STATE_TABLE", "ingest_state_v2")
 
 TABLE_INTEGRITY = os.environ.get("INTEGRITY_TABLE", "candle_integrity_day")
 
-MODE = os.environ.get("MODE", "backfill").lower()  # backfill | live | daily_once | weekly_once
+# Aggregation (intraday TFs built from 1m RTH)
+# Source 1m table (must contain premarket+rth; aggregation uses only rth rows)
+TABLE_1M_SOURCE = os.environ.get("TABLE_1M_SOURCE", "candle_history_1m")
+# Target derived tables
+TABLE_3M = os.environ.get("TABLE_3M", "candle_history_3m")
+TABLE_5M = os.environ.get("TABLE_5M", "candle_history_5m")
+TABLE_15M = os.environ.get("TABLE_15M", "candle_history_15m")
+TABLE_1H = os.environ.get("TABLE_1H", "candle_history_1h")
+
+# Build controls
+BUILD_DAYS_BACK = int(os.environ.get("BUILD_DAYS_BACK", "3"))  # used by MODE=build_intraday_tfs
+BUILD_VERIFY_COMPLETE = os.environ.get("BUILD_VERIFY_COMPLETE", "1") == "1"  # require 390 1m RTH mins
+
+MODE = os.environ.get("MODE", "backfill").lower()  # backfill | live | daily_once | weekly_once | build_intraday_tfs
 
 ALPACA_FEED = os.environ.get("ALPACA_FEED", "iex")
 TIMEFRAME = os.environ.get("TIMEFRAME", "1Min")
@@ -394,6 +407,192 @@ def verify_quick(sb: Client, cutoff_utc: datetime, now_utc: datetime) -> None:
 
 
 # =============================
+# DB READ (paged) + AGGREGATION
+# =============================
+def _sb_select_all_ts(
+    sb: Client,
+    table: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    session: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Read all 1m rows for [start_utc, end_utc) using range pagination.
+    Returns rows with keys: ts, open, high, low, close, volume, vwap, trade_count
+    """
+    rows: List[Dict[str, Any]] = []
+    page = 0
+    page_size = 1000  # Supabase default max per request often ~1000
+    while True:
+        q = (
+            sb.table(table)
+            .select("ts,open,high,low,close,volume,vwap,trade_count,session")
+            .eq("symbol", SYMBOL)
+            .gte("ts", iso_z(start_utc))
+            .lt("ts", iso_z(end_utc))
+            .order("ts", desc=False)
+            .range(page * page_size, page * page_size + page_size - 1)
+        )
+        if session is not None:
+            q = q.eq("session", session)
+        resp = q.execute()
+        data = resp.data or []
+        rows.extend(data)
+        if len(data) < page_size:
+            break
+        page += 1
+    return rows
+
+
+def _bucket_start_et(ts_et: datetime, minutes_per_bucket: int) -> datetime:
+    """Return bucket start ET anchored at 09:30."""
+    anchor = ts_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    mins = int((ts_et - anchor).total_seconds() // 60)
+    idx = mins // minutes_per_bucket
+    return anchor + timedelta(minutes=idx * minutes_per_bucket)
+
+
+def _aggregate_intraday_for_date(
+    sb: Client,
+    et_date: datetime.date,
+    minutes_per_bucket: int,
+    target_table: str,
+    is_hourly: bool = False,
+) -> int:
+    """
+    Aggregate RTH-only 1m candles for one ET date into target_table.
+    - Buckets anchored to 09:30 ET
+    - If is_hourly=True: clamp bucket end to 16:00 and allow final partial (15:30-16:00)
+    """
+    start_utc, end_utc = _et_day_bounds_utc(et_date)
+
+    # Pull 1m RTH rows from source table
+    one_min = _sb_select_all_ts(sb, TABLE_1M_SOURCE, start_utc, end_utc, session="rth")
+    if not one_min:
+        return 0
+
+    # Parse to datetimes and keep only minute precision
+    candles = []
+    for r in one_min:
+        ts = parse_ts(r["ts"]).replace(second=0, microsecond=0)
+        candles.append(
+            (
+                ts,
+                float(r["open"]),
+                float(r["high"]),
+                float(r["low"]),
+                float(r["close"]),
+                float(r.get("volume") or 0),
+                (float(r.get("vwap")) if r.get("vwap") is not None else None),
+                int(r.get("trade_count") or 0),
+            )
+        )
+
+    # Build buckets
+    buckets: Dict[datetime, List[tuple]] = {}
+    for (ts_utc, o, h, l, c, v, vw, n) in candles:
+        ts_et = ts_utc.astimezone(ET)
+        # safety: ensure inside RTH
+        if not (ts_et.hour > 9 or (ts_et.hour == 9 and ts_et.minute >= 30)):
+            continue
+        if ts_et.hour >= 16:
+            continue
+
+        bstart_et = _bucket_start_et(ts_et, minutes_per_bucket)
+        bstart_utc = bstart_et.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+        if is_hourly:
+            # allow last partial hour candle: any bucket that starts before 16:00 is valid
+            end_et = bstart_et + timedelta(minutes=minutes_per_bucket)
+            rth_end_et = ts_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            if bstart_et >= rth_end_et:
+                continue
+            # clamp end for conceptual correctness (we still group by start)
+            _ = min(end_et, rth_end_et)
+
+        buckets.setdefault(bstart_utc, []).append((ts_utc, o, h, l, c, v, vw, n))
+
+    # Aggregate each bucket -> one output row
+    out_rows: List[Dict[str, Any]] = []
+    for bstart_utc, vals in sorted(buckets.items(), key=lambda x: x[0]):
+        vals_sorted = sorted(vals, key=lambda x: x[0])
+        o = vals_sorted[0][1]
+        c = vals_sorted[-1][4]
+        h = max(x[2] for x in vals_sorted)
+        l = min(x[3] for x in vals_sorted)
+        vol = sum(x[5] for x in vals_sorted)
+        tc = sum(x[7] for x in vals_sorted)
+
+        # VWAP: Σ(price*vol)/Σ(vol); use 1m vwap if present else close
+        if vol > 0:
+            num = 0.0
+            den = 0.0
+            for (_ts, _o, _h, _l, _c, _v, _vw, _n) in vals_sorted:
+                if _v <= 0:
+                    continue
+                px = _vw if (_vw is not None and _vw != 0) else _c
+                num += px * _v
+                den += _v
+            vwap = (num / den) if den > 0 else None
+        else:
+            vwap = None
+
+        out_rows.append(
+            {
+                "symbol": SYMBOL,
+                "ts": iso_z(bstart_utc),
+                "session": "rth",
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "volume": vol,
+                "vwap": vwap,
+                "trade_count": tc,
+            }
+        )
+
+    if out_rows:
+        for batch in chunked(out_rows, UPSERT_CHUNK):
+            sb.table(target_table).upsert(batch, on_conflict="symbol,ts").execute()
+
+    return len(out_rows)
+
+
+def run_build_intraday_tfs(sb: Client) -> None:
+    """
+    Build 3m/5m/15m/1h candles from 1m RTH data in TABLE_1M_SOURCE.
+    RTH-only for derived TFs. Buckets anchored to 09:30 ET.
+    1h includes final partial candle (15:30-16:00).
+    """
+    print(f"[BUILD] symbol={SYMBOL} source={TABLE_1M_SOURCE}")
+    print(f"[BUILD] targets: 3m={TABLE_3M} 5m={TABLE_5M} 15m={TABLE_15M} 1h={TABLE_1H}")
+    print(f"[BUILD] days_back={BUILD_DAYS_BACK} verify_complete={BUILD_VERIFY_COMPLETE}")
+
+    today_et = datetime.now(ET).date()
+    # Build from oldest to newest within lookback
+    for i in range(BUILD_DAYS_BACK, -1, -1):
+        et_day = today_et - timedelta(days=i)
+        # Skip weekends quickly
+        if datetime(et_day.year, et_day.month, et_day.day, tzinfo=ET).weekday() >= 5:
+            continue
+
+        if BUILD_VERIFY_COMPLETE:
+            ok, missing, expected, actual = verify_rth_day(sb, et_day)
+            _upsert_integrity_row(sb, et_day, ok, missing, expected, actual)
+            if not ok:
+                print(f"[BUILD] {et_day} skipped (incomplete 1m RTH: {actual}/{expected}, missing={len(missing)})")
+                continue
+
+        c3 = _aggregate_intraday_for_date(sb, et_day, 3, TABLE_3M, is_hourly=False)
+        c5 = _aggregate_intraday_for_date(sb, et_day, 5, TABLE_5M, is_hourly=False)
+        c15 = _aggregate_intraday_for_date(sb, et_day, 15, TABLE_15M, is_hourly=False)
+        c1h = _aggregate_intraday_for_date(sb, et_day, 60, TABLE_1H, is_hourly=True)
+
+        print(f"[BUILD] {et_day} built: 3m={c3} 5m={c5} 15m={c15} 1h={c1h}")
+
+
+# =============================
 # BACKFILL
 # =============================
 def _compute_backfill_window(end_cursor: datetime) -> Tuple[datetime, datetime]:
@@ -633,8 +832,10 @@ def main():
         run_live(sb)
     elif MODE in ("daily_once", "weekly_once"):
         run_once(sb)
+    elif MODE == "build_intraday_tfs":
+        run_build_intraday_tfs(sb)
     else:
-        raise SystemExit("MODE must be 'backfill', 'live', 'daily_once', or 'weekly_once'.")
+        raise SystemExit("MODE must be 'backfill', 'live', 'daily_once', 'weekly_once', or 'build_intraday_tfs'.")
 
 
 if __name__ == "__main__":
