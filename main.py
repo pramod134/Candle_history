@@ -1,7 +1,7 @@
 """
 main.py — Alpaca -> Supabase candle ingestion with robust pagination support.
 
-Patch: prevent full derived rebuilds after restart by using tolerant + freshness checks for derived TF tables.
+Patch: (1) skip integrity checks on weekends/no-data days, (2) stop 1D/1W re-backfill when history already exists (tolerant + freshness).
 Adds AUTO orchestration for 1m + derived intraday + 1d/1w (Alpaca direct) with no env changes.
 
 AUTO mode orchestrates backfill + derived TF build + live updates with no env tweaking.
@@ -99,6 +99,13 @@ AUTO_FULL_BUILD_DAYS_BACK = int(
 # - max ts must be "fresh enough" compared to 1m max.
 DERIVED_HISTORY_TOL_DAYS = int(os.environ.get("DERIVED_HISTORY_TOL_DAYS", "7"))
 DERIVED_STALE_DAYS = int(os.environ.get("DERIVED_STALE_DAYS", "3"))
+
+# 1D/1W history detection tolerance (daily/weekly bars don't align perfectly with cutoff timestamp)
+# Min tolerance: allow 1d/1w min_ts to be newer than cutoff by this many days
+DAILY_HISTORY_TOL_DAYS = int(os.environ.get("DAILY_HISTORY_TOL_DAYS", "14"))
+WEEKLY_HISTORY_TOL_DAYS = int(os.environ.get("WEEKLY_HISTORY_TOL_DAYS", "28"))
+# Freshness: if 1d/1w max_ts is older than 1m max by this many days, treat as stale and backfill/refresh
+HTF_STALE_DAYS = int(os.environ.get("HTF_STALE_DAYS", "10"))
 
 # 1D/1W auto refresh cadence while service runs
 AUTO_DAILY_REFRESH_SECONDS = int(os.environ.get("AUTO_DAILY_REFRESH_SECONDS", "3600"))  # 1 hour
@@ -398,6 +405,24 @@ def _et_day_bounds_utc(et_date: datetime.date) -> Tuple[datetime, datetime]:
     start_et = datetime(et_date.year, et_date.month, et_date.day, 9, 30, tzinfo=ET)
     end_et = datetime(et_date.year, et_date.month, et_date.day, 16, 0, tzinfo=ET)
     return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
+
+
+def _day_has_any_candles(sb: Client, table: str, et_date: datetime.date) -> bool:
+    """
+    Returns True if there is at least one candle row for the ET date in [09:30, 16:00].
+    Used to avoid false integrity failures on weekends/holidays.
+    """
+    start_utc, end_utc = _et_day_bounds_utc(et_date)
+    resp = (
+        sb.table(table)
+        .select("ts")
+        .eq("symbol", SYMBOL)
+        .gte("ts", iso_z(start_utc))
+        .lt("ts", iso_z(end_utc))
+        .limit(1)
+        .execute()
+    )
+    return bool(resp.data)
 
 
 def _expected_rth_minutes_utc(et_date: datetime.date) -> List[datetime]:
@@ -775,6 +800,44 @@ def _derived_history_ok(sb: Client, table: str) -> bool:
     return True
 
 
+def _htf_history_ok(sb: Client, table: str, min_tol_days: int) -> bool:
+    """
+    Tolerant + freshness-based check for higher TF tables (1D/1W).
+
+    OK when:
+      - table has data
+      - min_ts is not "too new" vs cutoff (within tolerance window)
+      - max_ts is not stale vs 1m max (within HTF_STALE_DAYS)
+    """
+    _now, cutoff_utc = _cutoff_now_utc()
+    mn = get_table_min_ts(sb, table)
+    mx = get_table_max_ts(sb, table)
+    if not mn or not mx:
+        return False
+    try:
+        mn_dt = parse_ts(mn)
+        mx_dt = parse_ts(mx)
+    except Exception:
+        return False
+
+    tol_cutoff = cutoff_utc + timedelta(days=int(min_tol_days))
+    if mn_dt > tol_cutoff:
+        return False
+
+    src_max = get_table_max_ts(sb, TABLE_1M_SOURCE) or get_table_max_ts(sb, TABLE_CANDLES)
+    if not src_max:
+        return True
+    try:
+        src_max_dt = parse_ts(src_max)
+    except Exception:
+        return True
+
+    stale_floor = src_max_dt - timedelta(days=int(HTF_STALE_DAYS))
+    if mx_dt < stale_floor:
+        return False
+    return True
+
+
 def _ensure_1m_history(sb: Client) -> None:
     """
     Ensures 2y history exists in TABLE_CANDLES (default candle_history_1m).
@@ -866,7 +929,12 @@ def run_auto(sb: Client) -> None:
         now_utc, cutoff_utc = _cutoff_now_utc()
         print(f"[AUTO] ensure 1D/1W history (need earliest <= {iso_z(cutoff_utc)})")
 
-        if not _has_required_history(sb, TABLE_1D):
+        if _htf_history_ok(sb, TABLE_1D, DAILY_HISTORY_TOL_DAYS):
+            mx = get_table_max_ts(sb, TABLE_1D)
+            if mx:
+                set_state_last_ts_for(sb, "1d", mx)
+                print(f"[AUTO] 1D history OK; state(1d)={mx}")
+        else:
             print(f"[AUTO] 1D missing history in {TABLE_1D}; backfilling from Alpaca...")
             bars = alpaca_get_bars_tf("1Day", cutoff_utc, now_utc, limit=LIMIT, fetch_all_pages=True)
             rows = _rows_from_higher_tf_bars(bars)
@@ -876,13 +944,13 @@ def run_auto(sb: Client) -> None:
                 newest = rows[-1]["ts"]
                 set_state_last_ts_for(sb, "1d", newest)
                 print(f"[AUTO] 1D backfill wrote {len(rows)} rows; state(1d)={newest}")
-        else:
-            mx = get_table_max_ts(sb, TABLE_1D)
-            if mx:
-                set_state_last_ts_for(sb, "1d", mx)
-                print(f"[AUTO] 1D history OK; state(1d)={mx}")
 
-        if not _has_required_history(sb, TABLE_1W):
+        if _htf_history_ok(sb, TABLE_1W, WEEKLY_HISTORY_TOL_DAYS):
+            mx = get_table_max_ts(sb, TABLE_1W)
+            if mx:
+                set_state_last_ts_for(sb, "1w", mx)
+                print(f"[AUTO] 1W history OK; state(1w)={mx}")
+        else:
             print(f"[AUTO] 1W missing history in {TABLE_1W}; backfilling from Alpaca...")
             bars = alpaca_get_bars_tf("1Week", cutoff_utc, now_utc, limit=LIMIT, fetch_all_pages=True)
             rows = _rows_from_higher_tf_bars(bars)
@@ -892,11 +960,6 @@ def run_auto(sb: Client) -> None:
                 newest = rows[-1]["ts"]
                 set_state_last_ts_for(sb, "1w", newest)
                 print(f"[AUTO] 1W backfill wrote {len(rows)} rows; state(1w)={newest}")
-        else:
-            mx = get_table_max_ts(sb, TABLE_1W)
-            if mx:
-                set_state_last_ts_for(sb, "1w", mx)
-                print(f"[AUTO] 1W history OK; state(1w)={mx}")
 
     def _refresh_1d_1w_incremental(now_utc: datetime) -> None:
         last_1d = get_state_last_ts_for(sb, "1d")
@@ -1019,6 +1082,16 @@ def run_auto(sb: Client) -> None:
                     last_integrity_check = now_s
                     for d in range(INTEGRITY_LOOKBACK_DAYS):
                         et_day = (datetime.now(ET) - timedelta(days=d)).date()
+
+                        # Skip weekends (no trading)
+                        if et_day.weekday() >= 5:
+                            continue
+
+                        # Skip non-trading days/holidays where there are no candles at all
+                        # (prevents false "390 missing" alarms)
+                        if not _day_has_any_candles(sb, TABLE_1M_SOURCE, et_day):
+                            continue
+
                         ok, missing, expected, actual = verify_rth_day(sb, et_day)
                         _upsert_integrity_row(sb, et_day, ok, missing, expected, actual)
                         if ok:
@@ -1198,6 +1271,16 @@ def run_live(sb: Client) -> None:
                     last_integrity_check = now_s
                     for d in range(INTEGRITY_LOOKBACK_DAYS):
                         et_day = (datetime.now(ET) - timedelta(days=d)).date()
+
+                        # Skip weekends (no trading)
+                        if et_day.weekday() >= 5:
+                            continue
+
+                        # Skip non-trading days/holidays where there are no candles at all
+                        # (prevents false "390 missing" alarms)
+                        if not _day_has_any_candles(sb, TABLE_CANDLES, et_day):
+                            continue
+
                         ok, missing, expected, actual = verify_rth_day(sb, et_day)
                         _upsert_integrity_row(sb, et_day, ok, missing, expected, actual)
                         if ok:
